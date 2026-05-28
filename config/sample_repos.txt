@@ -1,0 +1,18 @@
+# sample_repos.txt — batch input for the rationalization agent
+# One repo per line, owner/name format
+# Lines starting with # are ignored
+
+# Expected: RETAIN
+facebook/react
+
+# Expected: RETAIN / REHOST
+expressjs/express
+
+# Expected: REFACTOR
+bluesky-social/social-app
+
+# Expected: RETIRE
+php-fig/fig-standards
+
+# Expected: RETIRE (edge case — near-zero code)
+kelseyhightower/nocode

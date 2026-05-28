@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+
+# Environment variables (contains GITHUB_TOKEN, ANTHROPIC_API_KEY)
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Generated reports
+outputs/reports/*.json
+
+# Python version pin (developer-local toolchain choice)
+.python-version
