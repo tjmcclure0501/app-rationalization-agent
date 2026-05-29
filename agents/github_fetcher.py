@@ -44,6 +44,11 @@ MANIFEST_FILENAMES = {
     "package-lock.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    # Node version pin files — strictly not "manifests" but the
+    # dependency_scanner reads them as a runtime fallback for repos
+    # that pin Node outside of package.json's engines field.
+    ".nvmrc",
+    ".node-version",
     # Python
     "requirements.txt",
     "setup.py",

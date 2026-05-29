@@ -32,6 +32,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -207,6 +209,27 @@ def analyze(repo_data: dict) -> dict:
         by_manifest[orig_name] = result
         if result.get("runtime"):
             runtime_findings.append(result["runtime"])
+
+    # --- Node runtime fallback: .nvmrc / .node-version ----------------------
+    # Many JS projects (facebook/react is the canonical example) pin their
+    # Node version in .nvmrc rather than package.json's `engines.node`.
+    # Without this fallback, runtime_eol comes back null, which used to
+    # silently kill the force_rewrite override checks for those repos.
+    if not any(r.get("language") == "node" for r in runtime_findings):
+        pin_lookup = {name.lower(): data for name, data in manifests.items()}
+        for pin_name in (".nvmrc", ".node-version"):
+            pin_data = pin_lookup.get(pin_name)
+            if not pin_data:
+                continue
+            version_str = _parse_node_pin(pin_data.get("content") or "")
+            if version_str:
+                runtime_findings.append({
+                    "language": "node",
+                    "version": version_str,
+                    "status":   _classify_node(version_str),
+                    "source":   pin_name,
+                })
+                break
 
     # --- Aggregate signals ----------------------------------------------------
     total_up = sum(m.get("up_to_date", 0) for m in by_manifest.values())
@@ -667,6 +690,67 @@ def _analyze_composer(content: str) -> dict:
 # ---------------------------------------------------------------------------
 # Runtime EOL classifiers (snapshot: 2026-05-28)
 # ---------------------------------------------------------------------------
+# Each classifier maps a version specifier to one of:
+#   "current" | "lts" | "maintenance" | "eol"
+# Once a major (or major.minor) crosses its published EOL date we still
+# treat it as "maintenance" for a configurable grace window — giving
+# project teams time to respond before the rubric penalises them as EOL.
+
+# EOL dates per runtime, used for the grace-period calculation. Keys
+# vary by runtime: Node uses just the major; Python and PHP key on
+# (major, minor) because each minor has its own date. Out-of-date
+# entries just lose the grace benefit, they don't break classification.
+_NODE_EOL_DATES: dict[int, str] = {
+    18: "2025-04-30",
+    20: "2026-04-30",
+    22: "2027-04-30",
+    24: "2028-04-30",
+}
+
+_PYTHON_EOL_DATES: dict[tuple[int, int], str] = {
+    (3, 9):  "2025-10-31",
+    (3, 10): "2026-10-31",
+    (3, 11): "2027-10-31",
+    (3, 12): "2028-10-31",
+    (3, 13): "2029-10-31",
+    (3, 14): "2030-10-31",
+}
+
+_PHP_EOL_DATES: dict[tuple[int, int], str] = {
+    (8, 2): "2025-12-08",
+    (8, 3): "2026-12-31",
+    (8, 4): "2027-12-31",
+    (8, 5): "2028-12-31",
+}
+
+
+def _eol_grace_period_days() -> int:
+    """
+    Grace window (days) after a runtime's official EOL date during
+    which it's still classified as "maintenance" rather than "eol".
+    Read from EOL_GRACE_PERIOD_DAYS in the environment; defaults to 90.
+    Negative / unparseable values fall back to the default.
+    """
+    raw = os.environ.get("EOL_GRACE_PERIOD_DAYS", "90")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 90
+    return value if value >= 0 else 90
+
+
+def _within_eol_grace_period(eol_date_str: Optional[str]) -> bool:
+    """True iff today is past the EOL date but within the grace window."""
+    if not eol_date_str:
+        return False
+    try:
+        eol_date = datetime.strptime(eol_date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    today = datetime.now(timezone.utc).date()
+    days_past = (today - eol_date).days
+    return 0 <= days_past <= _eol_grace_period_days()
+
 
 def _extract_major_minor(spec: str) -> tuple[Optional[int], Optional[int]]:
     """Pull the leading X[.Y] from a version specifier like '^3.11' or '>=8.1'."""
@@ -680,10 +764,35 @@ def _extract_major_minor(spec: str) -> tuple[Optional[int], Optional[int]]:
     return major, minor
 
 
+def _parse_node_pin(content: str) -> Optional[str]:
+    """
+    Extract a Node version string from a .nvmrc or .node-version file.
+
+    These files are typically a single line containing the version, with
+    or without a leading "v" (e.g. "20", "18.17.0", "v22.5.1", or
+    "lts/*"). We take the first non-empty line, strip the "v" prefix,
+    and pass the rest to _classify_node which already handles partial
+    versions like "lts/*" gracefully (returning None when nothing
+    numeric is found).
+    """
+    if not content:
+        return None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped.lstrip("vV")
+    return None
+
+
 def _classify_node(spec: str) -> Optional[str]:
     major, _ = _extract_major_minor(spec)
     if major is None:
         return None
+    # Grace-period check: if this major has only recently crossed its
+    # published EOL date, downgrade to "maintenance" rather than "eol"
+    # so projects aren't penalised the day after their runtime EOLs.
+    if _within_eol_grace_period(_NODE_EOL_DATES.get(major)):
+        return "maintenance"
     # Per the Node release calendar (Active LTS → Maintenance → EOL).
     if major >= 26:
         return "current"
@@ -703,6 +812,9 @@ def _classify_python(spec: str) -> Optional[str]:
         return "eol"
     if minor is None:
         return None
+    # Grace-period check (per-minor EOL dates for Python).
+    if _within_eol_grace_period(_PYTHON_EOL_DATES.get((major, minor))):
+        return "maintenance"
     if minor >= 14:
         return "current"
     if minor == 13:
@@ -749,6 +861,9 @@ def _classify_php(spec: str) -> Optional[str]:
         return None
     if major < 8 or minor is None:
         return "eol" if major is not None and major < 8 else None
+    # Grace-period check (per-minor EOL dates for PHP).
+    if _within_eol_grace_period(_PHP_EOL_DATES.get((major, minor))):
+        return "maintenance"
     if minor >= 5:
         return "current"
     if minor == 4:
@@ -805,16 +920,24 @@ def _try_open_issues_ratio(
 
 
 def _parse_link_last_page(link_header: Optional[str]) -> Optional[int]:
+    """
+    Extract the `page` parameter from a GitHub Link header's rel="last"
+    entry. Uses proper URL/query parsing so `page=` is not confused with
+    `per_page=` — the prior string-split version returned `1` from the
+    embedded `per_page=1` for high-issue-count repos.
+    """
     if not link_header:
         return None
     for part in link_header.split(","):
         if 'rel="last"' not in part:
             continue
         url = part.split(";", 1)[0].strip().strip("<>")
-        if "page=" not in url:
-            continue
         try:
-            return int(url.split("page=", 1)[1].split("&", 1)[0])
+            query = urllib.parse.urlparse(url).query
+            params = urllib.parse.parse_qs(query)
+            page_values = params.get("page")
+            if page_values:
+                return int(page_values[0])
         except (ValueError, IndexError):
             continue
     return None

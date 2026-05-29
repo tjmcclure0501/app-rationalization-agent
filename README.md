@@ -2,34 +2,100 @@
 
 ## Architectural Philosophy
 
-The rubric in `config/scoring_rubric.json` is the determinism layer of this
-system. It pins down the parts of a rationalization decision that need to be
-defensible to a stakeholder — category weights, recommendation thresholds,
-confidence floors, override rules — and freezes them as configuration an
-architect can review and tune without touching code. Everything else — which
-tools Claude invokes, in what order, how it interprets ambiguous signals, the
-prose of its rationale — is intentionally left to Claude.
+This system is built around a single design choice: the rubric in
+`config/scoring_rubric.json` is **governance context Claude reasons
+with**, not a rules engine that executes deterministically. Claude
+drives the entire pipeline — deciding which analyzers to call, in what
+order, and how to interpret ambiguous signals — but every
+recommendation is reasoned against the same documented thresholds,
+weights, and override rules. The path Claude takes varies; the
+yardstick it measures against does not.
 
-This places the system at a deliberate midpoint on a three-point spectrum. At
-one end, the deterministic pipeline (`agents/orchestrator.py`) runs every
-analyzer in fixed order and applies the rubric mechanically: maximally
-auditable, but unable to recognize that an EOL Java pin matters more than
-dependency staleness on a specific repo. At the other end, a pure agentic
-flow with no rubric reasons end-to-end by judgment alone: maximally flexible,
-but the decision boundary moves run to run and the rationale is harder to
-defend to a governance committee.
+That places the system at a deliberate point on a two-pole spectrum:
 
-The guided agentic flow (`agents/agentic_orchestrator.py` plus the rubric)
-sits between them. Claude decides how to investigate — which analyzer to call
-first based on what it sees, when it has enough signal to stop — but the
-final recommendation must clear the rubric's thresholds, the confidence floor
-must be met or the report is flagged for human review, and override rules can
-demote a recommendation regardless of what Claude concludes. The rubric
-provides governance and consistency; Claude provides judgment on the edge
-cases that rules alone cannot resolve.
+- **Pure agentic (no rubric)** — Claude reasons end-to-end by judgment
+  alone. Maximally flexible, but the decision boundary drifts between
+  runs, the rationale is hard to audit, and there's no way to express
+  organizational policy in a form a stakeholder can review.
+- **Guided agentic (`agents/agentic_orchestrator.py` + `scoring_rubric.json`)**
+  — Claude reasons within rubric-defined bounds. The thresholds,
+  weights, and override rules are versioned configuration anyone can
+  read; Claude's interpretation of edge cases provides the judgment
+  layer that pure rules can't.
 
-The rubric constrains *what* Claude decides while leaving Claude free to
-determine *how* it gets there.
+The rubric ensures recommendations are **consistent and explainable
+across runs** because Claude is always reasoning against the same
+documented governance layer — even though the path Claude takes to
+get there may vary. A recommendation produced today and the same
+recommendation produced six months from now will be defensible
+against the same set of thresholds, not against whatever the model
+happened to weigh in either moment.
+
+### What the rubric makes consistent vs. what intentionally remains adaptive
+
+The split is the core architectural argument for this design:
+
+**Consistent (rubric-defined)** — the parts that need to be defensible to a stakeholder are pinned as configuration:
+
+- *Category weights* — activity / health / quality / complexity contribute
+  in fixed proportions to the final score.
+- *Recommendation thresholds* — the score boundaries that map to RETAIN
+  / REHOST / REFACTOR / REWRITE / RETIRE.
+- *Confidence floors* — minimum confidence required per recommendation
+  tier; below the floor, the report is flagged for human review.
+- *Override rules* — `force_retire_if` / `force_rewrite_if` /
+  `force_review_if` clauses that demote a recommendation regardless of
+  what Claude concludes.
+- *Repo-type overrides* — which override rules are structurally
+  inapplicable for non-APPLICATION repo types (e.g. `lines_of_code < 50`
+  is suppressed for DOCUMENTATION repos).
+
+**Adaptive (Claude's judgment)** — the parts a rules engine cannot capture
+without becoming brittle:
+
+- *Tool call order* — which analyzer Claude invokes first on a given
+  repo. A dormant-looking repo gets `analyze_activity` priority; a
+  modern Java service gets `analyze_dependencies` first.
+- *Signal interpretation for edge cases* — recognizing that an EOL
+  runtime pin in a `.nvmrc` build-toolchain file matters less than an
+  EOL runtime in a deployed service, or that 12,000 open issues on a
+  hyper-popular library is normal rather than alarming.
+- *Natural-language rationale* — the architect-readable paragraph that
+  explains *why* this recommendation, in this repo's specific context,
+  drawing on signals the rubric scored but framing them for human
+  review.
+
+The rubric constrains *what* Claude decides while leaving Claude free
+to determine *how* it gets there.
+
+### Why Not Pure Agentic?
+
+Without the rubric, Claude would still produce reasonable
+recommendations — modern LLMs are good at portfolio judgment. The
+problem isn't quality, it's **governance**.
+
+Three things break in a pure-agentic flow:
+
+1. **Consistency across runs.** The same repo analyzed twice could
+   land on REFACTOR one day and REHOST the next, depending on which
+   signals Claude weighed more heavily. Stakeholders who own
+   portfolios of hundreds of applications cannot defend
+   moving-target recommendations.
+2. **Auditability.** When a recommendation is questioned in a steering
+   meeting, the answer needs to be "this exceeded the RETAIN threshold
+   of 0.75 with confidence 87%, and the rationale below explains why"
+   — not "the AI decided." The rubric is what makes that traceable
+   answer possible.
+3. **Organizational tuning.** Different organizations have different
+   risk tolerance, different compliance constraints, different cost
+   curves. A pure-agentic flow has no surface to express "we weight
+   security higher than activity" or "RETIRE requires 70% confidence,
+   not 40%." The rubric is that surface — versioned, reviewable, and
+   editable without touching code.
+
+The rubric is the governance layer that makes the LLM layer
+*operationally defensible*. Removing it would optimize for a kind of
+flexibility no portfolio architect actually wants.
 
 A multi-agent pipeline that evaluates public GitHub repositories and produces an
 application-rationalization recommendation against the 5-R framework: **Retain,
@@ -62,20 +128,18 @@ without manually opening each one.
 
 ## Architecture
 
-The project ships **two orchestrators** on top of the same analyzer modules:
+[agents/agentic_orchestrator.py](agents/agentic_orchestrator.py) is the
+sole entry point. It runs a manual tool-use loop against the
+Anthropic Messages API: each analyzer is exposed as a Claude tool,
+and Claude reasons between calls to decide which to invoke and how to
+interpret the results.
 
-| Orchestrator | Drives the pipeline | When to use |
-|---|---|---|
-| [agents/agentic_orchestrator.py](agents/agentic_orchestrator.py) | **Claude**, via tool use against the Anthropic API | Primary entry point. Each analyzer is exposed as a tool; Claude reasons between calls. |
-| [agents/orchestrator.py](agents/orchestrator.py) | Python, deterministic order | Fallback / reference. Runs every analyzer in fixed sequence; no LLM. |
-
-Both produce the same report schema and share `print_report` / `save_report`.
 The agentic flow is documented in [#The agentic loop](#the-agentic-loop) below.
 
 The analyzer modules are standalone Python: each exposes a single
-`analyze(repo_data)` (or `fetch_repo_data` / `score`) function. State is passed
-forward through a shared `repo_data` dict; the scorer is the only consumer that
-sees all stage outputs at once.
+`analyze(repo_data)` (or `fetch_repo_data` / `classify` / `score`) function.
+State is passed forward through a shared `repo_data` dict; the scorer is
+the only consumer that sees all stage outputs at once.
 
 ```
                     GitHub REST API
@@ -117,12 +181,38 @@ sees all stage outputs at once.
 
 | Module | Responsibility | Owns |
 |---|---|---|
-| [agents/orchestrator.py](agents/orchestrator.py) | CLI entry, stage dispatch, report serialization | — |
+| [agents/agentic_orchestrator.py](agents/agentic_orchestrator.py) | CLI entry, manual tool-use loop, report serialization, cost tracking | report shape, `print_report`, `save_report` |
 | [agents/github_fetcher.py](agents/github_fetcher.py) | All GitHub HTTP traffic + retry/rate-limit | shared `_build_client`, `_request` |
+| [agents/repo_classifier.py](agents/repo_classifier.py) | Pre-scoring stage: classifies repo as APPLICATION / LIBRARY / DOCUMENTATION / CONFIGURATION / DATA / UNKNOWN so downstream stages can adapt | `repo_type` |
 | [agents/code_analyzer.py](agents/code_analyzer.py) | Static analysis from the fetch payload | `quality_signals`, `complexity_signals` |
 | [agents/dependency_scanner.py](agents/dependency_scanner.py) | Per-manifest dep parsing + runtime EOL classification | `health_signals` |
 | [agents/activity_analyzer.py](agents/activity_analyzer.py) | Commit + contributor stats | `activity_signals` |
-| [agents/scorer.py](agents/scorer.py) | Final 5-R decision + overrides + confidence | aggregate |
+| [agents/scorer.py](agents/scorer.py) | Final 5-R decision + overrides + confidence; suppresses override rules that are structurally inapplicable to the repo's classified type | aggregate |
+
+### Repo-type taxonomy and why it exists
+
+The 5-R framework was designed for runtime software. A PHP spec
+repository (php-fig/fig-standards) or an awesome-list curation repo
+has zero LOC, no tests, no CI, no runtime, and no dependencies *by
+design* — but the rubric treats those as failures and used to fire
+`force_retire_if: lines_of_code < 50`. The classifier solves this by
+tagging the repo type early and letting the scorer suppress override
+rules whose signals don't apply:
+
+| Type | Meaning | Rubric behaviour |
+|---|---|---|
+| **APPLICATION**   | Deployable software (web service, CLI, mobile app) | Full 5-R rubric — primary target of the analysis. |
+| **LIBRARY**       | Reusable package or framework consumed by other software | Full 5-R rubric; CI/deployment signals interpreted against library norms. |
+| **DOCUMENTATION** | Specs, RFCs, awesome-lists, reference docs | LOC / test / CI / runtime override rules **suppressed** (see [config/scoring_rubric.json](config/scoring_rubric.json) `repo_type_overrides`). The agentic flow's system prompt instructs Claude to base the call on fitness-for-purpose signals: community adoption, maintenance cadence, institutional relevance. |
+| **CONFIGURATION** | IaC, dotfiles, config-only repos | LOC / test override rules suppressed. |
+| **DATA**          | Datasets, assets, content | LOC / test / runtime override rules suppressed. |
+| **UNKNOWN**       | Classifier could not determine the type | Full rubric, but report flagged for human review. |
+
+The classifier uses signals github_fetcher already returns —
+repository topics, description, file-extension distribution, presence
+or absence of dependency manifests, and README presence. No new API
+calls. See [agents/repo_classifier.py](agents/repo_classifier.py) for
+the heuristic order.
 
 ## Prerequisites
 
@@ -137,8 +227,8 @@ sees all stage outputs at once.
   Code workspace; not required to run the pipeline itself)
 - **GitHub personal access token** with `public_repo` scope — without one
   you'll hit the 60 req/hr unauthenticated limit.
-- **Anthropic API key** — required by the agentic orchestrator. Not needed
-  if you only run the deterministic `agents/orchestrator.py`.
+- **Anthropic API key** — required by `agents/agentic_orchestrator.py`,
+  which drives the pipeline via the Anthropic Messages API.
 
 ## Installation
 
@@ -201,8 +291,6 @@ The rubric is loaded at scorer import; restart the orchestrator after editing.
 
 ## Usage
 
-### Agentic mode (primary — Claude drives the pipeline)
-
 ```bash
 # Single repo, pretty terminal output
 python agents/agentic_orchestrator.py --repo facebook/react
@@ -217,17 +305,8 @@ python agents/agentic_orchestrator.py --repo expressjs/express --output json --s
 python agents/agentic_orchestrator.py --batch config/sample_repos.txt --save
 ```
 
-Requires `ANTHROPIC_API_KEY` in `.env`.
-
-### Deterministic mode (fallback — no LLM)
-
-```bash
-python agents/orchestrator.py --repo facebook/react
-python agents/orchestrator.py --batch config/sample_repos.txt
-```
-
-Same flags, same output schema. Use this when you don't have an Anthropic
-key, want bit-exact reproducibility, or are debugging an analyzer in isolation.
+Requires `ANTHROPIC_API_KEY` in `.env`. Prefix any command with `uv run`
+instead of activating the venv if you prefer.
 
 `--save` writes `outputs/reports/<owner>__<name>__<UTC-timestamp>.json`.
 `--verbose` prints full tracebacks for any failing stage.
@@ -347,7 +426,7 @@ showing $0.
 
 | Constant | Default | Defined in |
 |---|---|---|
-| Model | `claude-sonnet-4-20250514` | `MODEL` in [agents/agentic_orchestrator.py](agents/agentic_orchestrator.py) |
+| Model | `claude-sonnet-4-6` (Claude Sonnet 4.6) | `MODEL` in [agents/agentic_orchestrator.py](agents/agentic_orchestrator.py) |
 | Max tokens per turn | `4096` | `MAX_TOKENS` |
 | Max tool-calling iterations | `10` | `MAX_ITERATIONS` |
 | System prompt template | the 5-R framework + rubric | `_SYSTEM_PROMPT_TEMPLATE` |
@@ -447,16 +526,17 @@ cloud-cost analyzer):
    right category in `config/scoring_rubric.json` with a `weight` and a
    `score_map`. Keep weights summing to 1.0 within the category.
 
-3. **Wire it into the orchestrator.** In [agents/orchestrator.py](agents/orchestrator.py):
-   - Add an import block in `_import_agents()` mirroring the existing entries.
-   - Append a tuple to the `stages` list in `run_pipeline()`:
-
-     ```python
-     stages = [
-         # ...
-         ("<stage_key>", "Running <name>", "<name>"),
-     ]
-     ```
+3. **Expose it as a tool in the agentic orchestrator.** In
+   [agents/agentic_orchestrator.py](agents/agentic_orchestrator.py):
+   - Add an import for the new module at the top.
+   - Append a tool definition to the `TOOLS` list with a clear name,
+     description, and input schema.
+   - Add a handler branch in `_execute_tool` that invokes the analyzer,
+     stashes the result in `state["pipeline_stages"][<stage_key>]`,
+     and returns a summarized payload to Claude.
+   - If the new tool is required (like the existing analyzers), add it
+     to the defensive check that gates `score_recommendation` so Claude
+     can't score without running it first.
 
 4. **Teach the scorer where the signals live.** In
    [agents/scorer.py](agents/scorer.py), extend `_CATEGORY_TO_STAGE` if the new

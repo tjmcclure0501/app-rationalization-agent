@@ -46,17 +46,17 @@ import anthropic
 
 # Existing analyzer modules — reused verbatim as tool implementations.
 from github_fetcher import fetch_repo_data as _fetch_repo_data
+from repo_classifier import classify as _classify_repo
 from code_analyzer import analyze as _analyze_code
 from dependency_scanner import analyze as _analyze_deps
 from activity_analyzer import analyze as _analyze_activity
 from scorer import score as _score
 
-# Reuse the deterministic orchestrator's report formatting/saving helpers.
-from orchestrator import print_report, save_report, load_env
-
-# Rich is optional — orchestrator's helpers degrade gracefully when missing.
+# Rich is optional — the formatting helpers below degrade gracefully when
+# it's missing.
 try:
     from rich.console import Console
+    from rich.panel import Panel
     from rich import print as rprint
     RICH_AVAILABLE = True
     _console = Console()
@@ -66,14 +66,118 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Environment + report helpers (previously in orchestrator.py).
+# ---------------------------------------------------------------------------
+
+def load_env() -> None:
+    """Load environment variables from .env file."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        # python-dotenv is optional; environment variables can be set
+        # directly by the caller instead.
+        pass
+
+
+# Color used for each recommendation when rendering with Rich. REVIEW shares
+# bold-yellow with REFACTOR but is disambiguated by the prominent
+# _REVIEW_INCOMPLETE_NOTICE banner inside the panel.
+RECOMMENDATION_COLORS = {
+    "RETAIN":   "bold green",
+    "REHOST":   "bold blue",
+    "REFACTOR": "bold yellow",
+    "REWRITE":  "bold magenta",
+    "RETIRE":   "bold red",
+    "REVIEW":   "bold yellow",   # incomplete-signal demotion — see scorer.py
+    "UNKNOWN":  "bold white",
+    "ERROR":    "bold red",
+}
+
+# Banner shown above the rationale when the scorer produced REVIEW because
+# critical override signals were missing. The recommendation panel is
+# already yellow but a REVIEW report can otherwise look superficially
+# similar to a normal REFACTOR — this notice makes the difference loud.
+_REVIEW_INCOMPLETE_NOTICE = (
+    "⚠  REPORT INCOMPLETE — critical signals were missing during scoring. "
+    "Human investigation is required before any portfolio decision is made."
+)
+
+
+def print_report(report: dict) -> None:
+    """Pretty-print the final report to terminal."""
+    rec = report.get("recommendation", "UNKNOWN")
+    confidence = report.get("confidence", 0.0)
+    confidence_pct = f"{confidence * 100:.0f}%" if confidence is not None else "N/A"
+    flagged = report.get("flagged_for_review")
+    reasons = report.get("flagged_for_review_reasons") or []
+    is_review = rec == "REVIEW"
+
+    if RICH_AVAILABLE:
+        color = RECOMMENDATION_COLORS.get(rec, "white")
+        panel_content = (
+            f"[{color}]Recommendation: {rec}[/{color}]\n"
+            f"Confidence: {confidence_pct}\n\n"
+        )
+        # REVIEW means we couldn't score with confidence — surface that
+        # *before* the rationale so it's the first thing the architect reads.
+        if is_review:
+            panel_content += f"[bold yellow]{_REVIEW_INCOMPLETE_NOTICE}[/bold yellow]\n\n"
+        panel_content += f"[italic]{report.get('rationale', 'No rationale provided')}[/italic]"
+
+        if flagged:
+            panel_content += "\n\n[bold yellow]⚠ Flagged for human review[/bold yellow]"
+            if reasons:
+                for reason in reasons:
+                    panel_content += f"\n[yellow]    • {reason}[/yellow]"
+            else:
+                # No reasons attached — the flag was set without justification.
+                # Surfacing the gap explicitly so it can be debugged.
+                panel_content += "\n[yellow]    • (no reason recorded — check scorer output)[/yellow]"
+
+        _console.print(Panel(
+            panel_content,
+            title=f"[bold]{report['repo']}[/bold]",
+            subtitle=f"Analyzed {report['analyzed_at']}",
+            border_style=color.replace("bold ", "")
+        ))
+    else:
+        print(f"\n{'='*60}")
+        print(f"  Repo:           {report['repo']}")
+        print(f"  Recommendation: {rec}")
+        print(f"  Confidence:     {confidence_pct}")
+        if is_review:
+            print(f"  {_REVIEW_INCOMPLETE_NOTICE}")
+        print(f"  Rationale:      {report.get('rationale')}")
+        if flagged:
+            print("  ⚠ Flagged for human review")
+            if reasons:
+                for reason in reasons:
+                    print(f"      • {reason}")
+            else:
+                print("      • (no reason recorded — check scorer output)")
+        print(f"{'='*60}\n")
+
+
+def save_report(report: dict, output_dir: str = "outputs/reports") -> Path:
+    """Save the report as JSON under outputs/reports/."""
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    repo_safe = report["repo"].replace("/", "__")
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = path / f"{repo_safe}__{timestamp}.json"
+    with open(filename, "w") as f:
+        json.dump(report, f, indent=2)
+    return filename
+
+
+# ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
 
-# User-specified model. NOTE: claude-sonnet-4-20250514 is Claude Sonnet 4.0,
-# which is *deprecated* and slated for retirement on 2026-06-15. The current
-# Sonnet (and documented migration target) is `claude-sonnet-4-6`. Update
-# here if you migrate.
-MODEL = "claude-sonnet-4-20250514"
+# Model: Claude Sonnet 4.6. Using the canonical alias rather than a
+# date-pinned snapshot — auto-tracks the latest Sonnet 4.6 release.
+MODEL = "claude-sonnet-4-6"
 
 # Max tokens per assistant turn. Per spec — gives Claude room to reason
 # between tool calls but stays under the streaming-required threshold.
@@ -98,7 +202,6 @@ _PRICING_PER_M_TOKENS: dict[str, dict[str, float]] = {
     "claude-opus-4-7":           {"input": 5.00, "output": 25.00},
     "claude-opus-4-6":           {"input": 5.00, "output": 25.00},
     "claude-sonnet-4-6":         {"input": 3.00, "output": 15.00},
-    "claude-sonnet-4-20250514":  {"input": 3.00, "output": 15.00},  # Sonnet 4.0
     "claude-haiku-4-5":          {"input": 1.00, "output":  5.00},
 }
 
@@ -210,8 +313,11 @@ TOOLS: list[dict] = [
             "Fetch the GitHub repository's metadata, file tree, README, and "
             "dependency manifests (package.json, requirements.txt, pom.xml, "
             "go.mod, etc.). CALL THIS FIRST — every other tool requires this "
-            "context. Returns a summary; the full payload is cached for the "
-            "downstream analyzers."
+            "context. The tool also automatically runs the repo-type "
+            "classifier and returns its verdict in the `classification` "
+            "field (one of APPLICATION, LIBRARY, DOCUMENTATION, "
+            "CONFIGURATION, DATA, UNKNOWN). Use that classification to "
+            "shape your subsequent reasoning — see the system prompt."
         ),
         "input_schema": {
             "type": "object",
@@ -261,11 +367,15 @@ TOOLS: list[dict] = [
         "name": "score_recommendation",
         "description": (
             "Aggregate every signal gathered so far against the 5-R scoring "
-            "rubric and produce a deterministic structured recommendation "
-            "(RETAIN / REHOST / REFACTOR / REWRITE / RETIRE) with "
-            "confidence and per-category scores. Call this AFTER you have "
-            "enough signal — it is the closing tool. You may still adjust "
-            "the call in your final message."
+            "rubric and produce a deterministic structured recommendation. "
+            "REQUIRES that fetch_repo_data, analyze_code, "
+            "analyze_dependencies, AND analyze_activity have all already "
+            "returned. Calling this tool before all four have run will be "
+            "rejected with an error telling you which is missing — the "
+            "scorer cannot trust an incomplete signal set and will demote "
+            "the report to REVIEW if it tries. Returns one of RETAIN / "
+            "REHOST / REFACTOR / REWRITE / RETIRE, or REVIEW when critical "
+            "signals are missing."
         ),
         "input_schema": {
             "type": "object",
@@ -288,7 +398,10 @@ TOOLS: list[dict] = [
 # System prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT_TEMPLATE = """You are a senior solutions architect performing application rationalization on GitHub repositories. Your job is to decide whether each repo should be RETAINED, REHOSTED, REFACTORED, REWRITTEN, or RETIRED, and to produce a defensible recommendation with confidence and rationale.
+# Block 1 — role / framework / how-to-work / taxonomy / final-output.
+# Static across runs; included in the cached prefix via the cache_control
+# marker on Block 2 (the rubric) below.
+_SYSTEM_PROMPT_PREAMBLE_TEMPLATE = """You are a senior solutions architect performing application rationalization on GitHub repositories. Your job is to decide whether each repo should be RETAINED, REHOSTED, REFACTORED, REWRITTEN, or RETIRED, and to produce a defensible recommendation with confidence and rationale.
 
 # The 5-R framework
 - RETAIN — healthy, modern, actively maintained; leave alone.
@@ -297,24 +410,44 @@ _SYSTEM_PROMPT_TEMPLATE = """You are a senior solutions architect performing app
 - REWRITE — too degraded to salvage incrementally; EOL runtime, no tests, broad surface area.
 - RETIRE — low activity, superseded, or no longer needed; decommission.
 
-# How to work
-You have five tools. Use them deliberately — not every analyzer is relevant for every repo.
+There is also a sixth value the scorer can return — REVIEW — meaning the signal set was incomplete and the recommendation cannot be trusted. You should never *intend* to produce REVIEW; it is the scorer's safety net for when you skipped a required analyzer. Always gather a complete signal set so the scorer can make a real call.
 
-1. Call `fetch_repo_data` first. The summary tells you the language, manifests present, file count, license, last-pushed date, and whether the repo is archived. Reason about that before calling more tools.
-2. Decide which analyzers will most cheaply move you toward a confident call:
-   - Dormant-looking repo? → `analyze_activity` is the high-signal next step.
-   - Java pom.xml with old Java pin? → `analyze_dependencies` will tell you if the runtime is EOL.
-   - Many source files, unclear test coverage? → `analyze_code` for tests/CI/architecture.
-3. Between tool calls, briefly say what you observed and what you intend to check next. Skip an analyzer when its result is unlikely to change your call — a 100K-star repo with daily commits doesn't need a deep activity scan.
-4. When you have enough signal, call `score_recommendation`. The scorer produces a deterministic 5-R recommendation using the rubric below; you can use it verbatim or adjust the confidence/rationale based on your judgment.
-5. Flag low confidence explicitly when signals are sparse, conflicting, or you couldn't gather one of the analyzers.
+# How to work — REQUIRED tool sequence
+You have five tools. The first four gather signal; the fifth produces the recommendation. You MUST run every data-gathering tool before scoring.
+
+1. **First**: call `fetch_repo_data`. This establishes context — language, manifests, file count, license, last-pushed date, archived status — AND automatically runs the repo-type classifier. Read the `classification` field in the response carefully before deciding what to do next (see "Repo-type taxonomy" below).
+
+2. **Then call all three analyzers**, in any order, but every one of them:
+   - `analyze_code` — language, frameworks, LOC, tests, CI, architecture
+   - `analyze_dependencies` — runtime EOL, dep freshness
+   - `analyze_activity` — last-commit recency, commit frequency, contributor count
+
+   You MUST NOT skip any of these. The scorer's override rules (force_retire_if, force_rewrite_if) depend on signals from each — most critically, `analyze_activity` produces `last_commit_days`, which drives the dormant-repo retire override. Skipping an analyzer because the repo "looks obvious" produces a report with missing signals; the scorer will detect this and demote the recommendation to REVIEW. A 100K-star repo with daily commits still needs every analyzer to run — the cost is small and the safety is non-negotiable.
+
+3. **Between tool calls**, briefly say what you observed and what you intend to check next. The reasoning is for the audit trail, not for skipping work.
+
+4. **Only after fetch_repo_data + all three analyzers have returned**, call `score_recommendation`. The scorer applies the rubric mechanically to the full signal set. If you call it early, the orchestrator will reject the call with a tool_result error telling you which analyzer is still missing — at that point, run the missing analyzer and try again.
+
+5. **Flag low confidence explicitly** when signals are sparse, conflicting, or an analyzer reported errors.
+
+# Repo-type taxonomy — adjust your reasoning by type
+The classifier's `repo_type` field tells you which kind of repository you're looking at. The 5-R framework was designed for runtime software; for everything else you must reason differently.
+
+- **APPLICATION** — deployable software (web service, CLI, mobile app). The standard 5-R rubric applies cleanly. Use it as-is.
+- **LIBRARY** — reusable package or framework consumed by other software. The standard rubric also applies, with one nuance: "no deployment" and "no CI for end-to-end tests" are normal — judge maintenance and dep-health signals against the library's role.
+- **DOCUMENTATION** — pure docs, specs, standards, awesome-lists, RFC collections. **5-R analysis is structurally inapplicable in the rubric's usual sense.** Zero LOC, no tests, no CI, no runtime, and no dependencies are expected by design, not failures. The scorer suppresses the relevant override rules (per `repo_type_overrides` in the rubric), but the underlying category scores will still look weak. **You must override the scorer's threshold-based recommendation if necessary**, and base your call on fitness-for-purpose signals: community adoption (stars, forks, who depends on it institutionally), maintenance cadence (last commit date — even if frequency is low), and continued relevance (is the standard still cited / linked-to by active projects). Explain in the rationale that the standard rubric signals are inapplicable and which fitness-for-purpose signals drove your call.
+- **CONFIGURATION** — IaC, dotfiles, configs. Similar treatment to DOCUMENTATION: LOC/test/CI rules are suppressed; recommendation should be based on whether the configuration is still in active use, still targets supported infra, and is being maintained.
+- **DATA** — datasets, assets, content. Treat like DOCUMENTATION: rubric is structurally inapplicable; base call on currency, completeness, continued use.
+- **UNKNOWN** — classifier could not determine the type. Treat with caution and flag for review.
+
+For DOCUMENTATION, CONFIGURATION, and DATA repos: **still run all three analyzers** (you need the raw signals for the audit trail and so the scorer can compute what it can) — but in your final rationale, state explicitly that "the standard rubric signals are structurally inapplicable for this repo type," explain why, and ground the recommendation in fitness-for-purpose reasoning.
 
 # Final output
 After `score_recommendation`, your final assistant turn must end with a fenced JSON block matching this schema exactly:
 
 ```json
 {{
-  "recommendation": "RETAIN | REHOST | REFACTOR | REWRITE | RETIRE",
+  "recommendation": "RETAIN | REHOST | REFACTOR | REWRITE | RETIRE | REVIEW",
   "confidence": 0.0,
   "rationale": "Single architect-readable paragraph explaining the call: dominant signals, weak areas, anything that drove the confidence up or down.",
   "signals_summary": {{ "final_score": 0.0, "category_scores": {{ }} }},
@@ -322,23 +455,55 @@ After `score_recommendation`, your final assistant turn must end with a fenced J
 }}
 ```
 
-You may set `signals_summary` to the scorer's `signals_summary` verbatim. You may raise or lower `confidence` from the scorer's value if you have good reason — say so in the rationale. Outside the JSON, briefly state why you made any adjustments.
+If the scorer returned REVIEW, your recommendation must be REVIEW — do not override that to one of the 5-R values. The rationale must explain which analyzer's signals were missing.
 
-# Scoring rubric (reference — not hard rules)
+You may set `signals_summary` to the scorer's `signals_summary` verbatim. You may raise or lower `confidence` from the scorer's value if you have good reason — say so in the rationale. Outside the JSON, briefly state why you made any adjustments.
+"""
+
+# Block 2 — the scoring rubric. Its own content block so the cache_control
+# marker that ends here defines the cached prefix (tools + system blocks 1
+# and 2). The rubric is the largest single contributor to system-prompt
+# tokens and is byte-stable across every repo in a batch run.
+_SYSTEM_PROMPT_RUBRIC_HEADER = """# Scoring rubric (reference — not hard rules)
 The rubric below shows the weights and thresholds a senior architect would typically apply. The scorer uses these mechanically; you should weigh them with judgment. Override the threshold-based call only when the signals genuinely warrant it.
 
 ```json
-{rubric_json}
-```
+"""
 
-# Constraints
+_SYSTEM_PROMPT_RUBRIC_FOOTER = "\n```\n"
+
+# Block 3 — constraints. Kept after the rubric (preserving the original
+# narrative order so model behavior is unchanged) but OUTSIDE the cached
+# prefix. Stays small to minimise the uncached-tail cost.
+_SYSTEM_PROMPT_CONSTRAINTS = """# Constraints
 - You have at most {max_iterations} tool-calling turns. Budget them.
-- The scorer is the canonical scorer — always call it before producing your final JSON. If you cannot gather enough signal to call it confidently, still call it with whatever you have and set `flagged_for_review: true`.
+- All four data-gathering tools (`fetch_repo_data`, `analyze_code`, `analyze_dependencies`, `analyze_activity`) must run before `score_recommendation`. The orchestrator enforces this — premature scorer calls are rejected with an error tool_result.
+- If the scorer returns REVIEW, treat the report as incomplete: surface it as REVIEW in your final JSON and explain in the rationale which signals were missing.
 """
 
 
-def _build_system_prompt() -> list[dict]:
-    """Inline the rubric into the system prompt and mark it cacheable."""
+def _ephemeral_cache(cache_ttl: str) -> dict:
+    """Build the cache_control dict, honoring the configured TTL."""
+    control: dict = {"type": "ephemeral"}
+    if cache_ttl == "1h":
+        # 1-hour TTL costs 2× the input rate to write (vs 1.25× for 5min)
+        # but keeps the cache alive across long batch runs.
+        control["ttl"] = "1h"
+    return control
+
+
+def _build_system_prompt(cache_ttl: str = "5m") -> list[dict]:
+    """
+    Build the system prompt as 3 content blocks:
+      Block 1 — role / framework / how-to-work / taxonomy / final-output
+      Block 2 — scoring rubric (cache_control marker lands here)
+      Block 3 — runtime constraints (small, uncached)
+
+    The cache_control on Block 2 marks tools + Block 1 + Block 2 as the
+    cached prefix. Block 3 stays small so the uncached tail is cheap.
+    The narrative order is preserved exactly — only the transmission
+    structure changes.
+    """
     try:
         with open(RUBRIC_PATH) as f:
             rubric = json.load(f)
@@ -346,15 +511,42 @@ def _build_system_prompt() -> list[dict]:
         # Fall back to an empty rubric; the scorer surfaces its own error.
         rubric = {"_error": f"failed to load rubric: {e}"}
 
-    text = _SYSTEM_PROMPT_TEMPLATE.format(
-        rubric_json=json.dumps(rubric, indent=2),
-        max_iterations=MAX_ITERATIONS,
+    rubric_block_text = (
+        _SYSTEM_PROMPT_RUBRIC_HEADER
+        + json.dumps(rubric, indent=2)
+        + _SYSTEM_PROMPT_RUBRIC_FOOTER
     )
 
-    # Prompt caching: the system prompt is byte-stable across every repo in a
-    # batch run, so we mark it ephemeral. The cache is keyed by the rendered
-    # prefix; do NOT interpolate timestamps or per-run IDs above this point.
-    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+    return [
+        {
+            "type": "text",
+            "text": _SYSTEM_PROMPT_PREAMBLE_TEMPLATE,
+        },
+        {
+            "type": "text",
+            "text": rubric_block_text,
+            "cache_control": _ephemeral_cache(cache_ttl),
+        },
+        {
+            "type": "text",
+            "text": _SYSTEM_PROMPT_CONSTRAINTS.format(max_iterations=MAX_ITERATIONS),
+        },
+    ]
+
+
+def _build_tools(cache_ttl: str = "5m") -> list[dict]:
+    """
+    Return the TOOLS list with cache_control on the last entry, so the
+    tool definitions are included in the cached prefix. The Anthropic
+    API renders tools BEFORE system, so a marker at the end of tools
+    extends the cache to cover the entire tool block.
+    """
+    if not TOOLS:
+        return []
+    # Shallow-copy so the module-level TOOLS list isn't mutated.
+    cached_tools = [dict(t) for t in TOOLS]
+    cached_tools[-1] = {**cached_tools[-1], "cache_control": _ephemeral_cache(cache_ttl)}
+    return cached_tools
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +575,17 @@ def _execute_tool(
             result = _fetch_repo_data({"repo": repo})
             state["fetch"] = result
             state["pipeline_stages"]["fetch"] = result
-            return _summarize_fetch(result), False
+
+            # Pre-scoring stage: classify the repository type. Runs
+            # automatically here (not exposed as a separate tool) so
+            # Claude always sees the classification alongside the fetch
+            # summary, and the scorer can suppress rules for
+            # non-APPLICATION repo types per the rubric.
+            classification = _classify_repo({"fetch": result})
+            state["classification"] = classification
+            state["pipeline_stages"]["classification"] = classification
+
+            return _summarize_fetch(result, classification), False
 
         # Every downstream analyzer needs the fetch payload.
         if "fetch" not in state:
@@ -413,6 +615,33 @@ def _execute_tool(
             return _summarize_analyzer(result), False
 
         if tool_name == "score_recommendation":
+            # Belt-and-suspenders to the system-prompt rule: reject any
+            # score call where one of the four data-gathering stages
+            # hasn't populated state. The scorer would otherwise demote
+            # to REVIEW via the missing-signal pathway, but failing fast
+            # at the tool boundary gives Claude a clearer error to react
+            # to and avoids a wasted score evaluation.
+            required_stages = ("fetch", "code", "dependencies", "activity")
+            missing = [s for s in required_stages if s not in state]
+            if missing:
+                tool_for_stage = {
+                    "fetch":        "fetch_repo_data",
+                    "code":         "analyze_code",
+                    "dependencies": "analyze_dependencies",
+                    "activity":     "analyze_activity",
+                }
+                missing_tools = [tool_for_stage[s] for s in missing]
+                return {
+                    "error": (
+                        "score_recommendation called before all required "
+                        "analyzers ran. Missing: "
+                        + ", ".join(missing_tools)
+                        + ". Run the missing tool(s) first, then retry "
+                        "score_recommendation."
+                    ),
+                    "missing_tools": missing_tools,
+                }, True
+
             score_result = _score(state["pipeline_stages"])
             # Attach any architect commentary Claude included.
             notes = (tool_input or {}).get("rationale_notes")
@@ -435,10 +664,10 @@ def _execute_tool(
 # burn context. These helpers return only the fields Claude needs to reason —
 # the full data stays in `state` and feeds subsequent analyzers.
 
-def _summarize_fetch(result: dict) -> dict:
+def _summarize_fetch(result: dict, classification: Optional[dict] = None) -> dict:
     metadata = result.get("metadata") or {}
     readme = result.get("readme") or {}
-    return {
+    summary = {
         "repo": result.get("repo"),
         "metadata": metadata,
         "file_count": len(result.get("file_tree") or []),
@@ -449,6 +678,12 @@ def _summarize_fetch(result: dict) -> dict:
         "rate_limit": result.get("rate_limit"),
         "fetch_errors": result.get("errors") or [],
     }
+    if classification is not None:
+        # The classifier runs automatically right after fetch — surface
+        # its verdict so Claude can adjust its reasoning for non-
+        # APPLICATION repo types before deciding which analyzers to call.
+        summary["classification"] = classification
+    return summary
 
 
 def _summarize_analyzer(result: dict, category_key: str = "category_score") -> dict:
@@ -510,14 +745,18 @@ def _extract_final_json(text: str) -> Optional[dict]:
 # Agentic loop
 # ---------------------------------------------------------------------------
 
-def run_agentic_pipeline(repo: str, trace: bool = False) -> dict:
+def run_agentic_pipeline(
+    repo: str, trace: bool = False, cache_ttl: str = "5m"
+) -> dict:
     """
     Run one full agentic pipeline for a single repo.
 
     Returns a report dict whose top-level fields (recommendation, confidence,
-    rationale, flagged_for_review) match what orchestrator.print_report and
-    orchestrator.save_report expect, plus an `agentic` block recording the
-    full reasoning chain.
+    rationale, flagged_for_review) match what print_report and save_report
+    expect, plus an `agentic` block recording the full reasoning chain.
+
+    `cache_ttl` is "5m" (default) or "1h" and controls the TTL of the
+    prompt cache markers on the system prompt and tool definitions.
     """
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
@@ -552,8 +791,8 @@ def run_agentic_pipeline(repo: str, trace: bool = False) -> dict:
             response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=_build_system_prompt(),
-                tools=TOOLS,
+                system=_build_system_prompt(cache_ttl),
+                tools=_build_tools(cache_ttl),
                 messages=messages,
             )
         except anthropic.APIStatusError as e:
@@ -667,31 +906,73 @@ def _build_final_report(
     Merge Claude's parsed JSON with the deterministic scorer's output.
 
     Strategy:
-      - Use Claude's recommendation / confidence / rationale / flagged_for_review
-        when present and well-typed; fall back to the scorer otherwise.
-      - Always use the scorer's signals_summary (deterministic and complete).
-      - Surface the full tool-call trace for inspection.
+      - Use Claude's recommendation / confidence / rationale when present.
+      - Always use the scorer's signals_summary and review_reasons.
+      - **REVIEW is binding.** If the scorer returns REVIEW, that outcome
+        cannot be overridden by Claude's final JSON. REVIEW means the
+        input data is insufficient — that's a property of the inputs,
+        not a judgment Claude can talk its way out of. Claude's
+        contextual analysis is preserved as an audit note in the
+        rationale, and the override attempt is captured in
+        flagged_for_review_reasons.
     """
     claude_json = claude_json or {}
 
-    def _pick(key: str, default: Any) -> Any:
-        v = claude_json.get(key)
-        return v if v not in (None, "") else default
+    scorer_rec = fallback_score.get("recommendation")
+    scorer_review_locked = scorer_rec == "REVIEW"
+
+    # Start from the scorer's deterministic review reasons; we may append.
+    review_reasons: list = list(fallback_score.get("flagged_for_review_reasons", []))
+
+    if scorer_review_locked:
+        # Scorer's REVIEW is a hard ceiling — surface Claude's attempted
+        # call (if any) and lock the outcome.
+        claude_rec = claude_json.get("recommendation")
+        final_recommendation = "REVIEW"
+        final_confidence = fallback_score.get("confidence")
+        final_rationale = fallback_score.get("rationale") or ""
+
+        if claude_rec and claude_rec != "REVIEW":
+            claude_rationale = claude_json.get("rationale") or ""
+            final_rationale = (
+                final_rationale.rstrip(". ") + ". "
+                f"[LLM proposed {claude_rec} based on contextual analysis but "
+                "the scorer's REVIEW outcome is binding — the underlying signal "
+                "set was incomplete. LLM rationale preserved below for audit: "
+                f"\"{claude_rationale}\"]"
+            )
+            review_reasons.append(
+                f"LLM proposed {claude_rec} but was overridden — REVIEW is "
+                "binding when set by the scorer (signal set is incomplete)"
+            )
+        final_flagged = True
+    else:
+        # Normal merge path — Claude may set recommendation/confidence/
+        # rationale; scorer fills any blanks.
+        def _pick(key: str, default: Any) -> Any:
+            v = claude_json.get(key)
+            return v if v not in (None, "") else default
+
+        final_recommendation = _pick("recommendation", scorer_rec)
+        final_confidence = _pick("confidence", fallback_score.get("confidence"))
+        final_rationale = _pick("rationale", fallback_score.get("rationale"))
+        final_flagged = bool(
+            claude_json.get("flagged_for_review")
+            if "flagged_for_review" in claude_json
+            else fallback_score.get("flagged_for_review")
+        )
 
     return {
         "repo": repo,
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
         "model": MODEL,
         "pipeline_stages": pipeline_stages,
-        "recommendation": _pick("recommendation", fallback_score.get("recommendation")),
-        "confidence": _pick("confidence", fallback_score.get("confidence")),
-        "rationale": _pick("rationale", fallback_score.get("rationale")),
+        "recommendation": final_recommendation,
+        "confidence": final_confidence,
+        "rationale": final_rationale,
         "signals_summary": fallback_score.get("signals_summary"),
-        "flagged_for_review": bool(
-            claude_json.get("flagged_for_review")
-            if "flagged_for_review" in claude_json
-            else fallback_score.get("flagged_for_review")
-        ),
+        "flagged_for_review": final_flagged,
+        "flagged_for_review_reasons": review_reasons,
         "agentic": {
             "model": MODEL,
             "iterations": iteration,
@@ -699,6 +980,7 @@ def _build_final_report(
             "tool_calls": tool_call_log,
             "claude_final_text": final_text,
             "claude_parsed_json_present": bool(claude_json),
+            "scorer_review_locked": scorer_review_locked,
             "cost": {
                 "total":     cost_total,
                 "per_call":  per_call_cost,
@@ -718,6 +1000,7 @@ def _error_report(repo: str, message: str) -> dict:
         "rationale": message,
         "signals_summary": {},
         "flagged_for_review": True,
+        "flagged_for_review_reasons": [f"pipeline error: {message}"],
         "agentic": {
             "error": message,
             "cost": {"total": _new_cost_accumulator(), "per_call": []},
@@ -802,6 +1085,37 @@ def _print_cost_summary(report: dict) -> None:
         print(cost_line)
 
 
+def _print_cache_breakdown(report: dict) -> None:
+    """
+    Per-repo prompt-cache breakdown — only displayed when --show-costs
+    or --verbose is set. Surfaces the three numbers the user typically
+    cares about for diagnosing cache effectiveness within a single run.
+    """
+    cost = ((report.get("agentic") or {}).get("cost") or {}).get("total")
+    if not cost:
+        return
+    tokens = cost.get("tokens") or {}
+    cache_write = tokens.get("cache_creation", 0)
+    cache_read  = tokens.get("cache_read", 0)
+    full_price  = tokens.get("input", 0)
+
+    lines = [
+        "Cache usage (aggregate across this repo's API calls):",
+        f"  cache_creation_input_tokens: {cache_write:>10,}  "
+        f"(tokens written to cache — ~1.25× / ~2× write premium)",
+        f"  cache_read_input_tokens:     {cache_read:>10,}  "
+        f"(tokens read from cache — ~0.1× full price; this is the savings)",
+        f"  input_tokens:                {full_price:>10,}  "
+        f"(uncached, charged at full input rate)",
+    ]
+    if RICH_AVAILABLE:
+        for line in lines:
+            _console.print(f"[dim]{line}[/dim]")
+    else:
+        for line in lines:
+            print(line)
+
+
 def _print_batch_total(batch_total: dict, repo_count: int) -> None:
     """Aggregate LLM cost across every repo in a batch run."""
     calls = batch_total.get("calls", 0)
@@ -812,6 +1126,12 @@ def _print_batch_total(batch_total: dict, repo_count: int) -> None:
         f"  {calls} LLM call(s) | "
         f"in={tokens.get('input',0):,} out={tokens.get('output',0):,} "
         f"cache_w={tokens.get('cache_creation',0):,} cache_r={tokens.get('cache_read',0):,}"
+    )
+    # Highlight cumulative cache_read separately as the savings indicator.
+    cumulative_savings_line = (
+        f"  cumulative cache_read_input_tokens: "
+        f"{tokens.get('cache_read',0):,}  "
+        f"(↓ total tokens served from the prompt cache across the batch)"
     )
     if usd is None:
         cost_line = "  cost: $unknown (one or more calls used an unpriced model)"
@@ -824,10 +1144,12 @@ def _print_batch_total(batch_total: dict, repo_count: int) -> None:
     if RICH_AVAILABLE:
         _console.rule(f"[bold]{header}[/bold]")
         _console.print(token_line)
+        _console.print(cumulative_savings_line)
         _console.print(cost_line)
     else:
         print(f"\n=== {header} ===")
         print(token_line)
+        print(cumulative_savings_line)
         print(cost_line)
 
 
@@ -873,7 +1195,30 @@ def parse_args():
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print detailed exception tracebacks on failure",
+        help=(
+            "Print detailed exception tracebacks on failure. Also implies "
+            "--show-costs (prints the per-repo cache-token breakdown)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        choices=["5m", "1h"],
+        default="5m",
+        help=(
+            "Prompt cache TTL. '5m' (default) charges 1.25× the input rate "
+            "to write the cache. '1h' charges 2× to write but keeps the "
+            "cache warm across long batch runs that take longer than 5 "
+            "minutes end-to-end."
+        ),
+    )
+    parser.add_argument(
+        "--show-costs",
+        action="store_true",
+        help=(
+            "After each repo, print the per-repo cache-token breakdown: "
+            "cache_creation_input_tokens (writes), cache_read_input_tokens "
+            "(reads — the savings), and input_tokens (uncached, full price)."
+        ),
     )
     return parser.parse_args()
 
@@ -903,10 +1248,12 @@ def main():
     if RICH_AVAILABLE:
         _console.print(
             f"\n[bold cyan]Agentic App Rationalization[/bold cyan] — "
-            f"model={MODEL}, repos={len(repos)}, trace={args.trace}\n"
+            f"model={MODEL}, repos={len(repos)}, trace={args.trace}, "
+            f"cache_ttl={args.cache_ttl}\n"
         )
 
     batch_total = _new_cost_accumulator()
+    show_cache_breakdown = args.show_costs or args.verbose
 
     for repo in repos:
         if RICH_AVAILABLE:
@@ -915,7 +1262,9 @@ def main():
             print(f"\nAnalyzing: {repo}")
 
         try:
-            report = run_agentic_pipeline(repo, trace=args.trace)
+            report = run_agentic_pipeline(
+                repo, trace=args.trace, cache_ttl=args.cache_ttl
+            )
         except Exception as e:  # noqa: BLE001 — preserve batch progress on failure
             if args.verbose and RICH_AVAILABLE:
                 _console.print_exception()
@@ -926,6 +1275,8 @@ def main():
         else:
             print_report(report)
             _print_cost_summary(report)
+            if show_cache_breakdown:
+                _print_cache_breakdown(report)
 
         # Roll this repo's cost into the batch total.
         repo_cost = (report.get("agentic") or {}).get("cost") or {}

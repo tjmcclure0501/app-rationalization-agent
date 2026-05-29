@@ -19,6 +19,5 @@ dependencies = [
     "typing-extensions>=4.9.0",
 
     # Anthropic SDK — required by agents/agentic_orchestrator.py
-    # Not used by the deterministic orchestrator (agents/orchestrator.py).
     "anthropic>=0.40.0",
 ]

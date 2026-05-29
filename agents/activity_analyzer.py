@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -118,11 +119,21 @@ def analyze(repo_data: dict) -> dict:
             signals["commit_frequency_per_month"] = None
 
         # --- Contributor count -----------------------------------------------
+        # _fetch_contributor_count returns {"count": int, "is_estimate": bool}
+        # so we expose the flag alongside the raw count. The scorer reads
+        # only `contributor_count`; `contributor_count_is_estimate` is
+        # informational metadata for downstream rationale.
         try:
-            signals["contributor_count"] = _fetch_contributor_count(client, owner, name)
+            contrib = _fetch_contributor_count(client, owner, name)
         except Exception as e:
             errors.append(f"contributors: {e}")
+            contrib = None
+        if contrib is None:
             signals["contributor_count"] = None
+            signals["contributor_count_is_estimate"] = False
+        else:
+            signals["contributor_count"] = contrib["count"]
+            signals["contributor_count_is_estimate"] = contrib["is_estimate"]
 
     # --- Score against the rubric --------------------------------------------
     scored: dict[str, dict] = {}
@@ -237,41 +248,76 @@ def _fetch_participation(client: httpx.Client, owner: str, name: str) -> list[in
     return []
 
 
-def _fetch_contributor_count(client: httpx.Client, owner: str, name: str) -> Optional[int]:
-    """
-    Total contributor count via the Link-header trick.
+# GitHub's /contributors endpoint truncates the returned list at this
+# size for repos with very high contributor counts (the published cap
+# is "around 500"). Counts at or above this threshold are flagged as
+# an estimate / lower bound rather than an exact value.
+GITHUB_CONTRIBUTORS_CAP = 500
 
-    Requesting per_page=1 lets GitHub tell us the page count in the Link
-    header, which equals the total contributor count — far cheaper than
-    paginating through every contributor.
+
+def _fetch_contributor_count(
+    client: httpx.Client, owner: str, name: str
+) -> Optional[dict]:
     """
+    Estimate the total contributor count via the Link-header trick.
+
+    Approach: request `per_page=100` (the maximum the contributors
+    endpoint allows). When the response is paginated, the rel="last"
+    entry in the Link header gives the total number of pages — the
+    estimated count is `last_page * 100`. When the response fits on a
+    single page (no Link header), we count the body exactly.
+
+    GitHub caps the contributors list at ~500 entries for repos with
+    very high contributor counts. When our estimate reaches that cap
+    we flag `is_estimate=True`; the real contributor count for such
+    repos is a lower bound rather than the exact value (e.g.
+    facebook/react reports ~500 but actually has thousands).
+
+    Returns a dict { "count": int, "is_estimate": bool } or None on
+    error. Returns count=0 with is_estimate=False for empty repos.
+    """
+    per_page = 100
     resp = _request(
         client,
         f"/repos/{owner}/{name}/contributors",
-        params={"per_page": "1", "anon": "false"},
+        params={"per_page": str(per_page), "anon": "false"},
     )
     if resp.status_code == 204:
-        # GitHub returns 204 No Content for empty repos.
-        return 0
+        return {"count": 0, "is_estimate": False}
     if resp.status_code != 200:
         return None
 
     link = resp.headers.get("Link")
     last_page = _parse_last_page(link)
     if last_page is not None:
-        return last_page
+        # `last_page * per_page` is an upper bound on the count — the
+        # last page may be partially filled. Acceptable for our use
+        # case since the scoring rubric only buckets at 20+.
+        estimate = last_page * per_page
+        return {
+            "count": estimate,
+            "is_estimate": estimate >= GITHUB_CONTRIBUTORS_CAP,
+        }
 
-    # No Link header → fewer than 2 pages of 1 result → count the body.
+    # No Link header → all contributors fit on one page → exact count.
     payload = resp.json()
-    return len(payload) if isinstance(payload, list) else None
+    if isinstance(payload, list):
+        return {"count": len(payload), "is_estimate": False}
+    return None
 
 
 def _parse_last_page(link_header: Optional[str]) -> Optional[int]:
     """
     Extract the page number from a GitHub Link header's rel="last" entry.
 
-    Example: '<https://api.github.com/...?page=2>; rel="next",
-              <https://api.github.com/...?page=87>; rel="last"'
+    Uses proper query-string parsing so that the `page` parameter is not
+    confused with `per_page`. The previous string-split approach matched
+    `page=` inside `per_page=` and returned 1 instead of the real page
+    number (causing contributor_count to come back as 1 for high-traffic
+    repos like facebook/react).
+
+    Example: '<https://api.github.com/...?per_page=1&page=2>; rel="next",
+              <https://api.github.com/...?per_page=1&page=410>; rel="last"'
     """
     if not link_header:
         return None
@@ -279,12 +325,12 @@ def _parse_last_page(link_header: Optional[str]) -> Optional[int]:
         if 'rel="last"' not in part:
             continue
         url_segment = part.split(";", 1)[0].strip().strip("<>")
-        # Parse `page=` from the query string.
-        if "page=" not in url_segment:
-            continue
         try:
-            page_str = url_segment.split("page=", 1)[1].split("&", 1)[0]
-            return int(page_str)
+            query = urllib.parse.urlparse(url_segment).query
+            params = urllib.parse.parse_qs(query)
+            page_values = params.get("page")
+            if page_values:
+                return int(page_values[0])
         except (ValueError, IndexError):
             continue
     return None

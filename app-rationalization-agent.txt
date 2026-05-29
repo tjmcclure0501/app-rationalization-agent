@@ -1,0 +1,80 @@
+
+Agentic App Rationalization — model=claude-sonnet-4-6, repos=4, trace=False, cache_ttl=5m
+
+───────────────────────────────────────────────────────────────── facebook/react ──────────────────────────────────────────────────────────────────
+╭──────────────────────────────────────────────────────────────── facebook/react ─────────────────────────────────────────────────────────────────╮
+│ Recommendation: RETAIN                                                                                                                          │
+│ Confidence: 100%                                                                                                                                │
+│                                                                                                                                                 │
+│ facebook/react is one of the most actively maintained open-source libraries in existence. It scores 0.81 on the weighted 5-R rubric —           │
+│ comfortably above the 0.75 RETAIN threshold — driven by a perfect activity score (last commit 0 days ago, 27 commits/month, 500+ contributors), │
+│ a perfect quality score (tests, CI, detailed README, MIT license), and a modular 682K-LOC codebase. The only health deductions are cosmetic:    │
+│ Node 20 is in 'maintenance' mode rather than LTS (irrelevant to browser-targeted library artifacts and trivially fixable), and the open-issues  │
+│ ratio is near 1.0 (expected for a mega-project where issues serve as community discussion, RFC, and long-running bug tracking threads — not a   │
+│ neglect signal). Dependency freshness is a perfect 1.0 with all 99 classified dependencies up to date. As a LIBRARY, there is no deployment     │
+│ surface to rehost. No refactor, rewrite, or retirement criteria come remotely close to triggering. RETAIN with full confidence.                 │
+╰───────────────────────────────────────────────────── Analyzed 2026-05-29T12:00:50.366330Z ──────────────────────────────────────────────────────╯
+LLM: 4 call(s) | in=3,682 out=1,616 cache_w=1,370 cache_r=19,518
+cost: $0.0463 (in $0.0110 + out $0.0242 + cache_w $0.0051 + cache_r $0.0059)
+───────────────────────────────────────────────────────────────── redmine/redmine ─────────────────────────────────────────────────────────────────
+╭──────────────────────────────────────────────────────────────── redmine/redmine ────────────────────────────────────────────────────────────────╮
+│ Recommendation: RETAIN                                                                                                                          │
+│ Confidence: 88%                                                                                                                                 │
+│                                                                                                                                                 │
+│ Redmine is a mature, globally-adopted Ruby on Rails project management application with over a decade of continuous development. The GitHub     │
+│ repository is a mirror of the canonical SVN trunk (svn.redmine.org), which causes several signals to appear weaker than reality: contributor    │
+│ count shows only 8 on GitHub (much larger in SVN), open-issues ratio reads as 1.0 (only 3 GitHub mirror issues, while real tracking is on       │
+│ redmine.org), and the basic README is just a pointer to the actual documentation. Adjusting for these mirror-repo artifacts, every meaningful   │
+│ signal points to RETAIN: activity is exceptional (62 commits/month, last commit 2 days ago), quality is strong (tests present, CI configured,   │
+│ license in place, Rails/Rack framework well understood), and the 190K-LOC codebase is substantial but well within normal Rails application      │
+│ scale. Dependency freshness analysis was limited to a single JS dependency from package.json — the Ruby Gemfile was not fully classified —      │
+│ introducing a minor health-score uncertainty, but Redmine has a well-documented practice of tracking supported Ruby and Rails versions. No      │
+│ force-override rules fire: the repo is not dormant, tests exist, and the runtime_eol/dep-freshness AND condition cannot trigger because         │
+│ freshness is 1.0. The flagged_for_review signal from the scorer is a precautionary artifact of the missing runtime_eol field, not a genuine     │
+│ concern. Confidence is slightly reduced from the scorer's 0.92 to 0.88 to acknowledge the incomplete Gemfile dep scan and mirror-distorted      │
+│ contributor/issue signals.                                                                                                                      │
+╰───────────────────────────────────────────────────── Analyzed 2026-05-29T12:01:37.839985Z ──────────────────────────────────────────────────────╯
+LLM: 4 call(s) | in=4,526 out=1,917 cache_w=1,446 cache_r=19,162
+cost: $0.0535 (in $0.0136 + out $0.0288 + cache_w $0.0054 + cache_r $0.0057)
+──────────────────────────────────────────────────────────────────── atom/atom ────────────────────────────────────────────────────────────────────
+╭─────────────────────────────────────────────────────────────────── atom/atom ───────────────────────────────────────────────────────────────────╮
+│ Recommendation: RETIRE                                                                                                                          │
+│ Confidence: 90%                                                                                                                                 │
+│                                                                                                                                                 │
+│ atom/atom is a clear and unambiguous RETIRE. The repository was officially archived by GitHub (its own creator) in December 2022, following a   │
+│ formal deprecation announcement in June 2022 in favour of VS Code. The last commit was November 22, 2022 (1,283 days ago), commit frequency is  │
+│ zero, and the open_issues_ratio is 0.999 — all 994 open issues will never be addressed. The `force_retire_if: last_commit_days > 1095` override │
+│ fires unconditionally. The apparent contradiction between a quality score of 1.00 (tests, CI, detailed README, license, modular architecture)   │
+│ and an activity score of 0.25 is fully explained: Atom was a professionally built product that was intentionally wound down, not a neglected    │
+│ side-project. Dependency freshness at 0.98 reflects a snapshot frozen at archive time, not active maintenance. There is no path to resumption   │
+│ of development. Any organisation running internal Atom forks or editor integrations should migrate to an actively maintained alternative (VS    │
+│ Code, VSCodium, Zed, or similar). Confidence is set at 0.90 (slightly below the scorer's 0.92) to acknowledge the scorer's                      │
+│ `conflicting_signals_detected` flag, though the conflict is architecturally explained and does not introduce genuine uncertainty.               │
+╰───────────────────────────────────────────────────── Analyzed 2026-05-29T12:02:17.904176Z ──────────────────────────────────────────────────────╯
+LLM: 4 call(s) | in=3,473 out=1,641 cache_w=1,070 cache_r=20,553
+cost: $0.0452 (in $0.0104 + out $0.0246 + cache_w $0.0040 + cache_r $0.0062)
+───────────────────────────────────────────────────────────── getpatchwork/patchwork ──────────────────────────────────────────────────────────────
+╭──────────────────────────────────────────────────────────── getpatchwork/patchwork ─────────────────────────────────────────────────────────────╮
+│ Recommendation: REFACTOR                                                                                                                        │
+│ Confidence: 72%                                                                                                                                 │
+│                                                                                                                                                 │
+│ Patchwork is a mature, GPL-licensed Python web application for patch-tracking with 72 contributors, detailed documentation, full test coverage, │
+│ CI, and a healthy 30K LOC codebase — all strong quality signals. However, activity has collapsed: zero commits in the past 12 weeks, last       │
+│ commit ~444 days ago, and a near-total open issues ratio (0.99, 117 open) pointing to a deep maintenance backlog. The scorer returned REHOST    │
+│ (score 0.63) but flagged conflicting signals (activity 0.33 vs quality 1.00); I override to REFACTOR because the infra story is already         │
+│ addressed (Docker/docker-compose ship with the repo) and the real risk is code-health drift, not platform. The business logic is sound and the  │
+│ investment is justified: the project needs issue triage, a Django/runtime version audit (runtime EOL could not be determined from manifests),   │
+│ dependency reclassification (only 1 of 5 deps was classifiable), and architectural refactoring from 'mixed' toward a more modular structure.    │
+│ Confidence is set at 0.72 rather than the scorer's 0.92 to reflect the missing runtime_eol signal and genuine activity/quality tension.         │
+│                                                                                                                                                 │
+│ ⚠ Flagged for human review                                                                                                                      │
+│     • force_rewrite_if: runtime_eol == eol AND dependency_freshness < 0.3 could not be fully evaluated — missing signal(s): runtime_eol (rule   │
+│ cannot fire — another condition in the AND already fails)                                                                                       │
+│     • conflicting category scores — activity at 0.33 vs quality at 1.00 (spread 0.67 > 0.50)                                                    │
+╰───────────────────────────────────────────────────── Analyzed 2026-05-29T12:03:00.790075Z ──────────────────────────────────────────────────────╯
+LLM: 4 call(s) | in=4,355 out=1,732 cache_w=1,361 cache_r=19,165
+cost: $0.0499 (in $0.0131 + out $0.0260 + cache_w $0.0051 + cache_r $0.0057)
+─────────────────────────────────────────────────────────── Batch total across 4 repos ────────────────────────────────────────────────────────────
+  16 LLM call(s) | in=16,036 out=6,906 cache_w=5,247 cache_r=78,398
+  cumulative cache_read_input_tokens: 78,398  (↓ total tokens served from the prompt cache across the batch)
+  cost: $0.1949 (in $0.0481 + out $0.1036 + cache_w $0.0197 + cache_r $0.0235)

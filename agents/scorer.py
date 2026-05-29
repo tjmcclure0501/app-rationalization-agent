@@ -61,7 +61,12 @@ _CATEGORY_RUBRIC_KEY = {
 # Recommendations in score-descending order — used both for threshold
 # resolution and to constrain override re-routing (overrides only push
 # *down* the ladder, never up).
-_REC_ORDER = ("RETAIN", "REHOST", "REFACTOR", "REWRITE", "RETIRE")
+#
+# REVIEW is the "we don't know enough to say" outcome. It sits past RETIRE
+# in the demotion ladder so that *any* current value will demote to REVIEW
+# when missing-signal warnings fire. A REVIEW report must never be treated
+# as a portfolio decision — it's a request for human investigation.
+_REC_ORDER = ("RETAIN", "REHOST", "REFACTOR", "REWRITE", "RETIRE", "REVIEW")
 
 
 # ---------------------------------------------------------------------------
@@ -100,22 +105,32 @@ def score(pipeline_stages: dict) -> dict:
 
     # --- 5. Apply overrides (can re-route the recommendation, force review) -
     flat_signals = _flatten_signals(pipeline_stages)
-    overrides_applied, recommendation, force_review_override = _apply_overrides(
-        base_recommendation, flat_signals, category_results, confidence
+    # Pre-scoring classification (if the orchestrator ran repo_classifier).
+    # Used to suppress override rules whose underlying signals are
+    # structurally inapplicable to non-APPLICATION repo types.
+    repo_type = (pipeline_stages.get("classification") or {}).get("repo_type")
+    overrides_applied, recommendation, review_reasons = _apply_overrides(
+        base_recommendation, flat_signals, category_results, confidence,
+        repo_type=repo_type,
     )
 
     # --- 6. Decide flagged_for_review ----------------------------------------
-    flag_threshold = _RUBRIC.get("confidence", {}).get("flag_for_review_below", 0.55)
+    # The review_reasons list collected by _apply_overrides already covers
+    # `confidence < flag_for_review_below` and `conflicting_signals_detected`.
+    # Add the recommendation-tier min_confidence check here — it's not an
+    # override rule, it's a per-tier confidence floor from the rubric.
     rec_min_confidence = (
         _RUBRIC.get("thresholds", {})
         .get(recommendation.lower(), {})
         .get("min_confidence", 0.0)
     )
-    flagged_for_review = bool(
-        force_review_override
-        or confidence < flag_threshold
-        or confidence < rec_min_confidence
-    )
+    if confidence < rec_min_confidence:
+        review_reasons.append(
+            f"confidence {confidence:.0%} is below the {recommendation} tier's "
+            f"min_confidence ({rec_min_confidence:.0%})"
+        )
+
+    flagged_for_review = bool(review_reasons)
 
     # --- 7. Build the human-readable rationale -------------------------------
     rationale = _build_rationale(
@@ -127,6 +142,7 @@ def score(pipeline_stages: dict) -> dict:
         confidence_factors=confidence_factors,
         overrides=overrides_applied,
         signals=flat_signals,
+        review_reasons=review_reasons,
     )
 
     return {
@@ -145,8 +161,9 @@ def score(pipeline_stages: dict) -> dict:
                 c: r["scored"] for c, r in category_results.items()
             },
         },
-        "overrides_applied":  overrides_applied,
-        "flagged_for_review": flagged_for_review,
+        "overrides_applied":         overrides_applied,
+        "flagged_for_review":        flagged_for_review,
+        "flagged_for_review_reasons": review_reasons,
     }
 
 
@@ -348,117 +365,299 @@ def _flatten_signals(pipeline_stages: dict) -> dict[str, Any]:
     return merged
 
 
+def _suppressed_rules_for(repo_type: Optional[str]) -> frozenset[str]:
+    """
+    Return the set of override rule full-names suppressed for this repo
+    type per the rubric's `repo_type_overrides` section. Names are the
+    same `force_retire_if: ...` / `force_rewrite_if: ...` strings
+    emitted by _unevaluable_override_warnings.
+    """
+    if not repo_type:
+        return frozenset()
+    section = _RUBRIC.get("repo_type_overrides") or {}
+    return frozenset(
+        (section.get(repo_type) or {}).get("suppress_rules") or []
+    )
+
+
 def _apply_overrides(
     base_recommendation: str,
     signals: dict,
     category_results: dict,
     confidence: float,
-) -> tuple[list[dict], str, bool]:
+    repo_type: Optional[str] = None,
+) -> tuple[list[dict], str, list[str]]:
     """
     Evaluate the rubric's override rules. Retire/rewrite overrides can
-    *demote* the recommendation; review overrides only set the review
-    flag. Returns (overrides_applied, recommendation, force_review).
+    *demote* the recommendation; review overrides populate the
+    review_reasons list. Each appended override carries both the raw
+    rule text and a plain-English `reason` so downstream consumers
+    (rationale, print_report) can surface what actually happened.
+
+    Order: force_retire_if → force_rewrite_if → force_review_if. Retire
+    takes precedence over rewrite (rewrite is skipped if retire fired);
+    review never changes the recommendation, only flags it.
+
+    Returns (overrides_applied, recommendation, review_reasons).
     """
     applied: list[dict] = []
     recommendation = base_recommendation
-    force_review = False
+    review_reasons: list[str] = []
+
+    # --- Suppress rules whose signals are structurally inapplicable --------
+    # For non-APPLICATION repo types (DOCUMENTATION, CONFIGURATION, DATA)
+    # the rubric names specific override rules that must not fire. We
+    # record each suppression in `applied` for the audit trail.
+    suppressed = _suppressed_rules_for(repo_type)
+    for rule_name in sorted(suppressed):
+        applied.append({
+            "rule": rule_name,
+            "action": "suppressed_by_repo_type",
+            "reason": (
+                f"rule suppressed for repo_type={repo_type} — signal "
+                f"is structurally inapplicable per scoring_rubric.json "
+                f"repo_type_overrides"
+            ),
+        })
+
+    # --- Classify any unevaluable rules into demoting vs informational ------
+    # Surface every unevaluable rule as a review reason so the gap is visible,
+    # but only DEMOTING warnings — those where the missing signal is the only
+    # thing preventing the rule from firing — count toward REVIEW demotion.
+    # Suppressed rules are skipped entirely (their signals are not "missing",
+    # they're not applicable).
+    demoting_warnings, informational_warnings = _unevaluable_override_warnings(
+        signals, suppressed=suppressed
+    )
+    review_reasons.extend(demoting_warnings)
+    review_reasons.extend(informational_warnings)
 
     # --- force_retire_if -----------------------------------------------------
-    for rule in _check_force_retire(signals):
-        applied.append({"rule": rule, "action": "force_retire"})
+    retire_fired = False
+    for rule in _check_force_retire(signals, suppressed=suppressed):
+        applied.append({"rule": rule, "action": "force_retire", "reason": rule})
         recommendation = _demote_to(recommendation, "RETIRE")
+        retire_fired = True
 
     # --- force_rewrite_if ----------------------------------------------------
-    # Skip if we've already been demoted to RETIRE — retire dominates.
+    rewrite_fired = False
     if recommendation != "RETIRE":
-        for rule in _check_force_rewrite(signals):
-            applied.append({"rule": rule, "action": "force_rewrite"})
+        for rule in _check_force_rewrite(signals, suppressed=suppressed):
+            applied.append({"rule": rule, "action": "force_rewrite", "reason": rule})
             recommendation = _demote_to(recommendation, "REWRITE")
+            rewrite_fired = True
 
-    # --- force_review_if -----------------------------------------------------
+    # --- Conditional demote-to-REVIEW ---------------------------------------
+    # Demote ONLY when:
+    #   (a) at least one DEMOTING warning exists (a rule where the missing
+    #       signal could have changed the outcome), AND
+    #   (b) no retire/rewrite override has already fired definitively.
+    # Informational warnings alone do not trigger REVIEW.
+    if demoting_warnings and not retire_fired and not rewrite_fired:
+        applied.append({
+            "rule": "no_override_fired_with_demoting_unevaluable_rules",
+            "action": "demote_to_review",
+            "reason": (
+                "no force_retire_if/force_rewrite_if rule fired, and one or "
+                "more rules could not be evaluated due to missing signals "
+                "that could have caused them to fire — threshold-based "
+                "recommendation cannot be trusted"
+            ),
+        })
+        recommendation = "REVIEW"
+
+    # --- force_review_if: confidence below the rubric's flag threshold -------
     review_threshold = float(
         _RUBRIC.get("confidence", {}).get("flag_for_review_below", 0.55)
     )
     if confidence < review_threshold:
+        reason = (
+            f"confidence {confidence:.0%} is below the "
+            f"flag_for_review_below threshold ({review_threshold:.0%})"
+        )
         applied.append({
             "rule": f"confidence < {review_threshold}",
             "action": "force_review",
+            "reason": reason,
         })
-        force_review = True
+        review_reasons.append(reason)
 
-    if _conflicting_signals(category_results):
+    # --- force_review_if: category scores point in different directions -----
+    spread = _category_score_spread(category_results)
+    if spread is not None and spread["delta"] > 0.5:
+        reason = (
+            f"conflicting category scores — "
+            f"{spread['lowest_cat']} at {spread['lowest_score']:.2f} "
+            f"vs {spread['highest_cat']} at {spread['highest_score']:.2f} "
+            f"(spread {spread['delta']:.2f} > 0.50)"
+        )
         applied.append({
             "rule": "conflicting_signals_detected == true",
             "action": "force_review",
+            "reason": reason,
         })
-        force_review = True
+        review_reasons.append(reason)
 
-    return applied, recommendation, force_review
-
-
-def _check_force_retire(signals: dict) -> list[str]:
-    """force_retire_if rules from the rubric, encoded explicitly."""
-    fired: list[str] = []
-
-    last_commit_days = signals.get("last_commit_days")
-    if isinstance(last_commit_days, (int, float)) and last_commit_days > 1095:
-        fired.append("last_commit_days > 1095")
-
-    contributor_count = signals.get("contributor_count")
-    if (
-        contributor_count == 1
-        and isinstance(last_commit_days, (int, float))
-        and last_commit_days > 365
-    ):
-        fired.append("contributor_count == 1 AND last_commit_days > 365")
-
-    loc = signals.get("lines_of_code")
-    if isinstance(loc, (int, float)) and loc < 50:
-        fired.append("lines_of_code < 50")
-
-    return fired
+    return applied, recommendation, review_reasons
 
 
-def _check_force_rewrite(signals: dict) -> list[str]:
-    """force_rewrite_if rules from the rubric, encoded explicitly."""
-    fired: list[str] = []
-
-    # The rubric expresses "runtime_eol == true"; our signal is a string
-    # ("current"|"lts"|"maintenance"|"eol") — interpret the truthy case as "eol".
-    runtime_eol = signals.get("runtime_eol")
-    dep_freshness = signals.get("dependency_freshness")
-    if (
-        runtime_eol == "eol"
-        and isinstance(dep_freshness, (int, float))
-        and dep_freshness < 0.3
-    ):
-        fired.append("runtime_eol == eol AND dependency_freshness < 0.3")
-
-    # Similarly, "has_tests == false" → has_tests == "no" in our system.
-    has_tests = signals.get("has_tests")
-    loc = signals.get("lines_of_code")
-    if (
-        has_tests == "no"
-        and isinstance(loc, (int, float))
-        and loc > 50000
-    ):
-        fired.append("has_tests == no AND lines_of_code > 50000")
-
-    return fired
+# --- Override rule definitions ------------------------------------------
+# A single declarative table that drives both:
+#   - rule evaluation at runtime (_check_force_retire/_check_force_rewrite)
+#   - missing-signal classification (_unevaluable_override_warnings)
+# Keeping these in one place prevents drift between "what rules fire" and
+# "what signals the rules depend on" — a previous bug source.
+#
+# Each entry: (kind, short_name, [(signal_name, op, target), ...])
+# All conditions in a rule are AND'd. `op` is one of "==", "<", ">".
+# Equality compares values directly (works for both strings and numbers);
+# "<" and ">" coerce both sides to float.
+_OVERRIDE_RULES: tuple = (
+    ("force_retire",  "last_commit_days > 1095",
+        [("last_commit_days", ">", 1095)]),
+    ("force_retire",  "contributor_count == 1 AND last_commit_days > 365",
+        [("contributor_count", "==", 1), ("last_commit_days", ">", 365)]),
+    ("force_retire",  "lines_of_code < 50",
+        [("lines_of_code", "<", 50)]),
+    ("force_rewrite", "runtime_eol == eol AND dependency_freshness < 0.3",
+        [("runtime_eol", "==", "eol"), ("dependency_freshness", "<", 0.3)]),
+    ("force_rewrite", "has_tests == no AND lines_of_code > 50000",
+        [("has_tests", "==", "no"), ("lines_of_code", ">", 50000)]),
+)
 
 
-def _conflicting_signals(category_results: dict) -> bool:
+def _eval_condition(signal_name: str, op: str, target: Any, signals: dict) -> str:
     """
-    True when category scores point in very different directions — defined
-    as a spread > 0.5 between the strongest and weakest scored category.
-    Used by force_review_if to surface ambiguous repos for human review.
+    Evaluate one rule condition against the signal namespace.
+
+    Returns:
+        "pass"    — condition holds
+        "fail"    — condition definitively does not hold (rule cannot fire)
+        "unknown" — signal is absent or wrong type; outcome indeterminate
     """
-    scores = [
-        r["score"] for r in category_results.values() if r["score"] is not None
+    v = signals.get(signal_name)
+    if v is None:
+        return "unknown"
+    if op == "==":
+        return "pass" if v == target else "fail"
+    try:
+        v_num = float(v)
+        t_num = float(target)
+    except (TypeError, ValueError):
+        return "unknown"
+    if op == ">":
+        return "pass" if v_num > t_num else "fail"
+    if op == "<":
+        return "pass" if v_num < t_num else "fail"
+    return "unknown"
+
+
+def _check_force_retire(
+    signals: dict, suppressed: frozenset[str] = frozenset()
+) -> list[str]:
+    """Return the short names of every force_retire_if rule that fires.
+
+    Rules in `suppressed` (passed as full names, e.g. 'force_retire_if:
+    lines_of_code < 50') are skipped regardless of whether the
+    underlying conditions hold."""
+    return [
+        name for kind, name, conds in _OVERRIDE_RULES
+        if kind == "force_retire"
+        and f"{kind}_if: {name}" not in suppressed
+        and all(_eval_condition(s, op, t, signals) == "pass" for s, op, t in conds)
     ]
-    if len(scores) < 2:
-        return False
-    return (max(scores) - min(scores)) > 0.5
+
+
+def _check_force_rewrite(
+    signals: dict, suppressed: frozenset[str] = frozenset()
+) -> list[str]:
+    """Return the short names of every force_rewrite_if rule that fires."""
+    return [
+        name for kind, name, conds in _OVERRIDE_RULES
+        if kind == "force_rewrite"
+        and f"{kind}_if: {name}" not in suppressed
+        and all(_eval_condition(s, op, t, signals) == "pass" for s, op, t in conds)
+    ]
+
+
+def _unevaluable_override_warnings(
+    signals: dict, suppressed: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
+    """
+    Walk the override rule table and classify any rule that contains an
+    unknown (missing) condition into one of two buckets:
+
+      - **demoting**: every known condition passes, so the missing signal
+        is the *only* thing preventing the rule from firing. Outcome is
+        genuinely uncertain — this is the case that warrants a REVIEW
+        demotion when no other override has fired.
+
+      - **informational**: at least one *other* known condition already
+        evaluates to "fail", so the AND rule cannot fire regardless of
+        what the missing signal is. Worth surfacing as a transparency
+        warning, but does NOT justify demoting the recommendation.
+
+    Returns (demoting_warnings, informational_warnings).
+    """
+    demoting: list[str] = []
+    informational: list[str] = []
+
+    for kind, name, conditions in _OVERRIDE_RULES:
+        full_name = f"{kind}_if: {name}"
+        if full_name in suppressed:
+            # Rule is structurally inapplicable to this repo type —
+            # missing signals are not "unknown", they're irrelevant.
+            continue
+        statuses = [
+            (s, _eval_condition(s, op, t, signals))
+            for s, op, t in conditions
+        ]
+        if not any(status == "unknown" for _, status in statuses):
+            continue  # rule is fully evaluable — no warning needed
+        missing = [s for s, status in statuses if status == "unknown"]
+        any_fail = any(status == "fail" for _, status in statuses)
+        prefix = f"{kind}_if: {name}"
+        msg_missing = "missing signal(s): " + ", ".join(missing)
+
+        if any_fail:
+            informational.append(
+                f"{prefix} could not be fully evaluated — {msg_missing} "
+                "(rule cannot fire — another condition in the AND already fails)"
+            )
+        else:
+            demoting.append(
+                f"{prefix} could not be fully evaluated — {msg_missing} "
+                "(rule could fire if signal were present — outcome genuinely uncertain)"
+            )
+
+    return demoting, informational
+
+
+def _category_score_spread(category_results: dict) -> Optional[dict]:
+    """
+    Inspect the per-category scores and return the strongest/weakest pair
+    plus the absolute delta — so callers can both make the
+    conflicting_signals decision *and* explain which categories caused it.
+
+    Returns None when fewer than two categories produced a score.
+    """
+    scored: list[tuple[str, float]] = [
+        (cat, r["score"])
+        for cat, r in category_results.items()
+        if r.get("score") is not None
+    ]
+    if len(scored) < 2:
+        return None
+    scored.sort(key=lambda x: x[1])
+    lowest_cat, lowest_score = scored[0]
+    highest_cat, highest_score = scored[-1]
+    return {
+        "lowest_cat":    lowest_cat,
+        "lowest_score":  lowest_score,
+        "highest_cat":   highest_cat,
+        "highest_score": highest_score,
+        "delta":         highest_score - lowest_score,
+    }
 
 
 def _demote_to(current: str, target: str) -> str:
@@ -485,11 +684,12 @@ def _build_rationale(
     confidence_factors: list[str],
     overrides: list[dict],
     signals: dict,
+    review_reasons: list[str],
 ) -> str:
     """
     Single paragraph an architect can act on: the call, the strongest /
-    weakest dimensions, salient signals, and any overrides or confidence
-    caveats that influenced the outcome.
+    weakest dimensions, salient signals, any overrides that influenced
+    the outcome, and — if the report is flagged for review — exactly why.
     """
     parts: list[str] = []
 
@@ -525,9 +725,17 @@ def _build_rationale(
     if notable:
         parts.append("Notable signals: " + "; ".join(notable) + ".")
 
+    # Render overrides using the descriptive `reason` (falling back to `rule`
+    # for compatibility), so e.g. force_review entries surface the actual
+    # numbers instead of an opaque "conflicting_signals_detected == true".
     if overrides:
-        rule_text = "; ".join(o["rule"] for o in overrides)
-        parts.append(f"Overrides triggered: {rule_text}.")
+        override_text = "; ".join(o.get("reason") or o["rule"] for o in overrides)
+        parts.append(f"Overrides triggered: {override_text}.")
+
+    # Dedicated, prominent sentence whenever the report is flagged for review,
+    # so an architect skimming the rationale immediately sees *why*.
+    if review_reasons:
+        parts.append("Flagged for human review: " + "; ".join(review_reasons) + ".")
 
     if confidence_factors:
         # Top three are enough to give the architect the texture.
@@ -623,6 +831,9 @@ def _empty_rubric_result() -> dict:
         },
         "overrides_applied": [],
         "flagged_for_review": True,
+        "flagged_for_review_reasons": [
+            f"scoring rubric could not be loaded from {RUBRIC_PATH}"
+        ],
     }
 
 
@@ -663,3 +874,106 @@ if __name__ == "__main__":
     }
     result = score(pipeline_stages)
     print(json.dumps(result, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Regression trace — php-fig/fig-standards
+# ---------------------------------------------------------------------------
+# Reference scenario used to verify the override pipeline. If a future
+# refactor breaks the force_retire_if pathway, the deterministic trace
+# below must still produce the expected output.
+#
+# Repo: php-fig/fig-standards — a finished PHP specification repository.
+# No active development since ~2022; multiple historical contributors;
+# composer.json pins a current PHP version; modest LOC (mostly markdown).
+#
+# Representative signals reaching the scorer (after all analyzers run):
+#     pipeline_stages = {
+#         "fetch":        { "signals": {} },
+#         "code":         { "signals": {
+#             "has_tests": "partial",
+#             "has_readme": "detailed",
+#             "has_ci": "yes",
+#             "has_license": "yes",
+#             "lines_of_code": 8_000,
+#             "architecture_signals": "modular",
+#         }},
+#         "dependencies": { "signals": {
+#             "runtime_eol": "current",
+#             "dependency_freshness": 0.85,
+#             "open_issues_ratio": 0.15,
+#         }},
+#         "activity":     { "signals": {
+#             "last_commit_days": 1500,              # ~4 years dormant
+#             "commit_frequency_per_month": 0.5,
+#             "contributor_count": 30,
+#         }},
+#     }
+#
+# Expected execution path through score():
+#   1. _score_category() runs for each rubric category. Activity scores
+#      ~0.38 (low recency + low frequency offset by 30 contributors).
+#      Health, quality, complexity all score high.
+#   2. _aggregate_final_score() → weighted mean ≈ 0.74.
+#   3. _map_to_recommendation(0.74) → "REHOST" (≥ 0.55, < 0.75).
+#      ↑ This is base_recommendation. It is NOT the final answer.
+#   4. _compute_confidence() → ~92% (all categories produce a score).
+#   5. _apply_overrides("REHOST", signals, ...):
+#        a. _unevaluable_override_warnings → [] (all signals present).
+#        b. _check_force_retire(signals):
+#             last_commit_days=1500 > 1095        →  rule fires
+#             contributor_count=30, not == 1      →  rule does not fire
+#             lines_of_code=8000, not < 50        →  rule does not fire
+#           → ["last_commit_days > 1095"]
+#           → recommendation = _demote_to("REHOST", "RETIRE") = "RETIRE"
+#        c. _check_force_rewrite skipped (recommendation == "RETIRE").
+#        d. force_review_if: category spread > 0.5 likely fires
+#           (activity ~0.38 vs complexity ~1.00 = 0.62 spread).
+#           → adds review_reasons entry, does not change recommendation.
+#   6. Return:
+#        recommendation:       "RETIRE"           (from override)
+#        base_recommendation:  "REHOST"           (from threshold mapping)
+#        flagged_for_review:   True               (conflicting signals)
+#        flagged_for_review_reasons: ["conflicting category scores — …"]
+#        overrides_applied:    [{ action: "force_retire", reason: "…" },
+#                               { action: "force_review",  reason: "…" }]
+#
+# Second documented case — php-fig/fig-standards (docs-only repo):
+#   Signals reaching the scorer:
+#       last_commit_days=93, contributor_count=1, lines_of_code=0,
+#       runtime_eol=None, dependency_freshness=None, has_tests="no"
+#
+#   _unevaluable_override_warnings classifies the rewrite rule
+#   `runtime_eol == eol AND dependency_freshness < 0.3` as DEMOTING:
+#   both conditions are unknown, neither already-failing, so the rule
+#   could fire if the signals were present.
+#   _check_force_retire:
+#       last_commit_days=93 > 1095          → False
+#       contributor_count==1 AND 93 > 365   → False (last_commit_days fails)
+#       lines_of_code=0 < 50                → TRUE → recommendation = RETIRE
+#   Because retire_fired is True, the demoting warning is surfaced as a
+#   review_reasons entry but does NOT trigger the demote-to-REVIEW
+#   branch. Final: recommendation = RETIRE, flagged_for_review = True.
+#
+# Third documented case — over-conservative REVIEW (the bug behind
+# requiring _unevaluable_override_warnings to differentiate by impact):
+#   Imagine a healthy active repo missing only runtime_eol but with
+#   dependency_freshness = 0.95. The rewrite rule
+#   `runtime_eol == eol AND dependency_freshness < 0.3` has:
+#       runtime_eol            → unknown
+#       0.95 < 0.3             → FAIL
+#   The AND already cannot fire regardless of runtime_eol. This is
+#   classified as INFORMATIONAL, not DEMOTING — it surfaces in
+#   review_reasons for transparency but does NOT cause a REVIEW
+#   demotion. Without this distinction the previous code over-demoted
+#   healthy repos to REVIEW any time runtime_eol was absent (a common
+#   tooling gap for Node projects that pin in .nvmrc rather than
+#   package.json — which dependency_scanner now also reads).
+#
+# Failure mode behind the original RETAIN-at-82% bug report:
+#   If `last_commit_days` is missing from pipeline_stages["activity"]
+#   (e.g. activity_analyzer never ran), the single-condition rule
+#   `last_commit_days > 1095` has no partner condition to disqualify
+#   it → DEMOTING warning. If no retire/rewrite rule fires, demote to
+#   REVIEW. The base high-score RETAIN can no longer pass through
+#   silently — the report comes back REVIEW with explicit warnings.

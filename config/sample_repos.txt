@@ -2,17 +2,10 @@
 # One repo per line, owner/name format
 # Lines starting with # are ignored
 
-# Expected: RETAIN
+# Classifier type → expected recommendation per the repo_classifier
+# taxonomy (see repo_classifier.py + repo_type_overrides in scoring_rubric.json).
+
 facebook/react
-
-# Expected: RETAIN / REHOST
-expressjs/express
-
-# Expected: REFACTOR
-bluesky-social/social-app
-
-# Expected: RETIRE
-php-fig/fig-standards
-
-# Expected: RETIRE (edge case — near-zero code)
-kelseyhightower/nocode
+redmine/redmine
+atom/atom
+getpatchwork/patchwork

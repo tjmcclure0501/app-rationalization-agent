@@ -163,5 +163,35 @@
         "conflicting_signals_detected == true"
       ]
     }
+  },
+
+  "repo_type_overrides": {
+    "_comment": "Per-repo-type adjustments applied AFTER threshold scoring. suppress_rules names override rules (by their canonical full name 'force_retire_if: <expr>' or 'force_rewrite_if: <expr>') that must NOT fire for the given repo type because the underlying signals are structurally inapplicable. APPLICATION and LIBRARY repos run the full rubric unchanged.",
+
+    "DOCUMENTATION": {
+      "suppress_rules": [
+        "force_retire_if: lines_of_code < 50",
+        "force_rewrite_if: has_tests == no AND lines_of_code > 50000",
+        "force_rewrite_if: runtime_eol == eol AND dependency_freshness < 0.3"
+      ],
+      "rationale": "Doc-only repos (specs, PSR collections, awesome-lists) have no executable code, no runtime, no dependencies, and no tests by design. LOC/test/CI/runtime signals are structurally inapplicable. Claude is expected to base the recommendation on fitness-for-purpose signals (community adoption, maintenance cadence, institutional relevance) instead."
+    },
+
+    "CONFIGURATION": {
+      "suppress_rules": [
+        "force_retire_if: lines_of_code < 50",
+        "force_rewrite_if: has_tests == no AND lines_of_code > 50000"
+      ],
+      "rationale": "Infra-as-code, dotfiles, and config-only repos rarely have traditional source-code LOC or unit tests. Runtime/dep signals may still be relevant if the repo includes terraform/ansible runtimes, so those rules are not suppressed."
+    },
+
+    "DATA": {
+      "suppress_rules": [
+        "force_retire_if: lines_of_code < 50",
+        "force_rewrite_if: has_tests == no AND lines_of_code > 50000",
+        "force_rewrite_if: runtime_eol == eol AND dependency_freshness < 0.3"
+      ],
+      "rationale": "Data/asset/content repos have no runtime code, no dependencies, no tests. The standard 5-R rubric doesn't apply; Claude should evaluate on currency, completeness, and continued use."
+    }
   }
 }
